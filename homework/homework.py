@@ -95,3 +95,181 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+
+from pathlib import Path
+import pandas as pd
+import numpy as np
+import zipfile
+import pickle
+import json
+import gzip
+import os
+
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import GridSearchCV
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    balanced_accuracy_score,
+    f1_score,
+    confusion_matrix,
+)
+
+
+
+def load_data(path):
+    path = Path(path)
+
+    if not path.exists():
+        raise FileNotFoundError(f"No existe el archivo: {path}")
+
+    if path.suffix == ".zip":
+        try:
+            return pd.read_csv(path, compression="zip", index_col=False)
+        except Exception:
+            with zipfile.ZipFile(path, "r") as z:
+                csvs = [f for f in z.namelist() if f.endswith(".csv")]
+                if not csvs:
+                    raise ValueError("No hay CSV dentro del zip.")
+                with z.open(csvs[0]) as f:
+                    return pd.read_csv(f, index_col=False)
+
+    return pd.read_csv(path, index_col=False)
+
+
+train = load_data("files/input/train_data.csv.zip")
+test = load_data("files/input/test_data.csv.zip")
+
+
+# PASO 1: Limpieza de datos
+
+def clean(df):
+    df = df.copy()
+
+    df.rename(columns={"default payment next month": "default"}, inplace=True)
+
+    if "ID" in df.columns:
+        df = df.drop(columns=["ID"])
+
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+
+    df = df.dropna()
+
+    return df
+
+
+train = clean(train)
+test = clean(test)
+
+
+# PASO 2: Separar X_train, y_train, X_test, y_test 
+
+X_train = train.drop(columns=["default"])
+y_train = train["default"]
+X_test = test.drop(columns=["default"])
+y_test = test["default"]
+
+
+# PASO 3: Pipeline (OneHot + MinMax + SelectKBest + LogisticRegression)
+
+categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+numeric_cols = [c for c in X_train.columns if c not in categorical_cols]
+
+preprocess = ColumnTransformer(
+    transformers=[
+        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
+        ("num", MinMaxScaler(), numeric_cols),
+    ]
+)
+
+pipeline = Pipeline(
+    steps=[
+        ("preprocess", preprocess),
+        ("select", SelectKBest(score_func=f_classif, k=10)),
+        ("model", LogisticRegression(max_iter=1000)),
+    ]
+)
+
+
+# PASO 4: GRIDSEARCHCV
+
+param_grid = {
+    "select__k": range(5, 20),
+    "model__C": [0.1, 1, 10],
+    "model__solver": ["liblinear", "lbfgs"],
+}
+
+grid = GridSearchCV(
+    estimator=pipeline,
+    param_grid=param_grid,
+    scoring="balanced_accuracy",
+    cv=10,
+    n_jobs=-1,
+)
+
+grid.fit(X_train, y_train)
+
+
+#  PASO 5: Guardar modelo
+
+os.makedirs("files/models", exist_ok=True)
+os.makedirs("files/output", exist_ok=True)
+
+with gzip.open("files/models/model.pkl.gz", "wb") as f:
+    pickle.dump(grid, f)
+
+
+# PASO 6 y 7: Métricas + Matriz
+
+def compute_metrics(X, y, name):
+    y_pred = grid.predict(X)
+    return {
+        "type": "metrics",
+        "dataset": name,
+        "precision": float(precision_score(y, y_pred)),
+        "balanced_accuracy": float(balanced_accuracy_score(y, y_pred)),
+        "recall": float(recall_score(y, y_pred)),
+        "f1_score": float(f1_score(y, y_pred)),
+    }
+
+
+def confusion_to_dict(cm, name):
+    return {
+        "type": "cm_matrix",
+        "dataset": name,
+        "true_0": {
+            "predicted_0": int(cm[0, 0]),
+            "predicted_1": int(cm[0, 1]),
+        },
+        "true_1": {
+            "predicted_0": int(cm[1, 0]),
+            "predicted_1": int(cm[1, 1]),
+        },
+    }
+
+
+metrics_list = []
+
+# Métricas
+metrics_list.append(compute_metrics(X_train, y_train, "train"))
+metrics_list.append(compute_metrics(X_test, y_test, "test"))
+
+# Matrices de confusión
+cm_train = confusion_matrix(y_train, grid.predict(X_train))
+cm_test = confusion_matrix(y_test, grid.predict(X_test))
+
+metrics_list.append(confusion_to_dict(cm_train, "train"))
+metrics_list.append(confusion_to_dict(cm_test, "test"))
+
+# Guardar
+with open("files/output/metrics.json", "w", encoding="utf-8") as f:
+    for row in metrics_list:
+        f.write(json.dumps(row) + "\n")
+
+print("Proceso Completado.")
+
