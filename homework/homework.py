@@ -96,6 +96,7 @@
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
 
+# flake8: noqa: E501
 
 from pathlib import Path
 import pandas as pd
@@ -259,14 +260,14 @@ metrics_list = []
 metrics_list.append(compute_metrics(X_train, y_train, "train"))
 metrics_list.append(compute_metrics(X_test, y_test, "test"))
 
-# Matrices de confusión
+# Matrices
 cm_train = confusion_matrix(y_train, grid.predict(X_train))
 cm_test = confusion_matrix(y_test, grid.predict(X_test))
 
 metrics_list.append(confusion_to_dict(cm_train, "train"))
 metrics_list.append(confusion_to_dict(cm_test, "test"))
 
-# Guardar
+# Guardar archivo
 with open("files/output/metrics.json", "w", encoding="utf-8") as f:
     for row in metrics_list:
         f.write(json.dumps(row) + "\n")
