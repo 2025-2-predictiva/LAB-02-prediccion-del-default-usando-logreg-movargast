@@ -98,181 +98,171 @@
 
 # flake8: noqa: E501
 
-from pathlib import Path
-import pandas as pd
-import numpy as np
-import zipfile
-import pickle
+import os
 import json
 import gzip
-import os
+import pickle
+import pandas as pd
 
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.pipeline import Pipeline
-from sklearn.model_selection import GridSearchCV
-from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.feature_selection import SelectKBest, f_regression
 from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+
 from sklearn.metrics import (
     precision_score,
-    recall_score,
     balanced_accuracy_score,
+    recall_score,
     f1_score,
     confusion_matrix,
 )
 
+# Rutas
 
+TRAIN_PATH = "files/input/train_data.csv.zip"
+TEST_PATH = "files/input/test_data.csv.zip"
+MODEL_PATH = "files/models/model.pkl.gz"
+METRICS_PATH = "files/output/metrics.json"
 
-def load_data(path):
-    path = Path(path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"No existe el archivo: {path}")
-
-    if path.suffix == ".zip":
-        try:
-            return pd.read_csv(path, compression="zip", index_col=False)
-        except Exception:
-            with zipfile.ZipFile(path, "r") as z:
-                csvs = [f for f in z.namelist() if f.endswith(".csv")]
-                if not csvs:
-                    raise ValueError("No hay CSV dentro del zip.")
-                with z.open(csvs[0]) as f:
-                    return pd.read_csv(f, index_col=False)
-
-    return pd.read_csv(path, index_col=False)
-
-
-train = load_data("files/input/train_data.csv.zip")
-test = load_data("files/input/test_data.csv.zip")
 
 
 # PASO 1: Limpieza de datos
 
-def clean(df):
+def load_data():
+    train = pd.read_csv(TRAIN_PATH, index_col=False, compression="zip")
+    test = pd.read_csv(TEST_PATH, index_col=False, compression="zip")
+    return train, test
+
+def clean_data(df):
     df = df.copy()
-
-    df.rename(columns={"default payment next month": "default"}, inplace=True)
-
+    df = df.rename(columns={"default payment next month": "default"})
     df = df.drop(columns=["ID"])
-
-    # Los registros con EDUCATION=0 o MARRIAGE=0 deben eliminarse (requisito implícito del dataset)
-    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
-
+    df = df[df["MARRIAGE"] != 0]
+    df = df[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
     df = df.dropna()
-
-    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
-
     return df
-
-
-train = clean(train)
-test = clean(test)
 
 
 # PASO 2: Separar X_train, y_train, X_test, y_test 
 
-X_train = train.drop(columns=["default"])
-y_train = train["default"]
-X_test = test.drop(columns=["default"])
-y_test = test["default"]
+def split_X_y(df):
+    return df.drop(columns=["default"]), df["default"]
 
 
 # PASO 3: Pipeline (OneHot + MinMax + SelectKBest + LogisticRegression)
 
-categorical_cols = ["SEX", "EDUCATION", "MARRIAGE"]
-numeric_cols = [c for c in X_train.columns if c not in categorical_cols]
+def build_pipeline():
 
-preprocess = ColumnTransformer(
-    transformers=[
-        ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
-        ("num", MinMaxScaler(), numeric_cols),
-    ]
-)
+    categorical_features = ["SEX", "EDUCATION", "MARRIAGE"]
 
-pipeline = Pipeline(
-    steps=[
-        ("preprocess", preprocess),
-        ("select", SelectKBest(score_func=f_classif, k=10)),
-        ("model", LogisticRegression(max_iter=1000)),
-    ]
-)
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), categorical_features)
+        ],
+        remainder=MinMaxScaler()
+    )
 
+    pipeline = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("feature_selection", SelectKBest(score_func=f_regression)),
+            ("classifier", LogisticRegression(max_iter=1000, random_state=42)),
+        ],
+        verbose=False,
+    )
+
+    return pipeline
 
 # PASO 4: GRIDSEARCHCV
 
-param_grid = {
-    "select__k": range(5, 20),
-    "model__C": [0.1, 1, 10],
-    "model__solver": ["liblinear", "lbfgs"],
-}
+def optimize_hyperparameters(pipeline, x_train):
+    
+    param_grid = {
+        "feature_selection__k": range(1, len(x_train.columns) + 1),
+        "classifier__C": [0.1, 1, 10],
+        "classifier__solver": ["liblinear", "lbfgs"],
+    }
 
-grid = GridSearchCV(
-    estimator=pipeline,
-    param_grid=param_grid,
-    scoring="balanced_accuracy",
-    cv=10,
-    n_jobs=-1,
-)
-
-grid.fit(X_train, y_train)
-
+    return GridSearchCV(
+        estimator=pipeline,
+        param_grid=param_grid,
+        cv=10,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True
+    )
 
 #  PASO 5: Guardar modelo
 
-os.makedirs("files/models", exist_ok=True)
-os.makedirs("files/output", exist_ok=True)
+def save_model(model):
+    os.makedirs("files/models", exist_ok=True)
+    with gzip.open(MODEL_PATH, "wb") as f:
+        pickle.dump(model, f)
 
-with gzip.open("files/models/model.pkl.gz", "wb") as f:
-    pickle.dump(grid, f)
 
+# PASO 6: Métricas
 
-# PASO 6 y 7: Métricas + Matriz
+def compute_metrics(dataset_name, y_true, y_pred):
 
-def compute_metrics(X, y, name):
-    y_pred = grid.predict(X)
     return {
         "type": "metrics",
-        "dataset": name,
-        "precision": float(precision_score(y, y_pred)),
-        "balanced_accuracy": float(balanced_accuracy_score(y, y_pred)),
-        "recall": float(recall_score(y, y_pred)),
-        "f1_score": float(f1_score(y, y_pred)),
+        "dataset": dataset_name,
+        "precision": precision_score(y_true, y_pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "recall": recall_score(y_true, y_pred, zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, zero_division=0),
     }
 
+# PASO 7: Matriz de confusión
 
-def confusion_to_dict(cm, name):
+def compute_confusion(dataset_name, y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred)
     return {
         "type": "cm_matrix",
-        "dataset": name,
-        "true_0": {
-            "predicted_0": int(cm[0, 0]),
-            "predicted_1": int(cm[0, 1]),
-        },
-        "true_1": {
-            "predicted_0": int(cm[1, 0]),
-            "predicted_1": int(cm[1, 1]),
-        },
+        "dataset": dataset_name,
+        "true_0": {"predicted_0": int(cm[0][0]), "predicted_1": int(cm[0][1])},
+        "true_1": {"predicted_0": int(cm[1][0]), "predicted_1": int(cm[1][1])},
     }
+    
+# Ejecución del proceso
+
+def main():
+
+    train_df, test_df = load_data()
+    train_df = clean_data(train_df)
+    test_df = clean_data(test_df)
+
+    X_train, y_train = split_X_y(train_df)
+    X_test, y_test = split_X_y(test_df)
+
+    pipeline = build_pipeline()
+    model = optimize_hyperparameters(pipeline, X_train)
+    model.fit(X_train, y_train)
+
+    save_model(model)
+
+    # predicciones
+    y_train_pred = model.predict(X_train)
+    y_test_pred = model.predict(X_test)
+
+    # métricas
+    train_metrics = compute_metrics("train", y_train, y_train_pred)
+    test_metrics = compute_metrics("test", y_test, y_test_pred)
+
+    train_cm = compute_confusion("train", y_train, y_train_pred)
+    test_cm = compute_confusion("test", y_test, y_test_pred)
+
+    os.makedirs("files/output", exist_ok=True)
+
+    with open(METRICS_PATH, "w", encoding="utf-8") as f:
+        f.write(json.dumps(train_metrics) + "\n")
+        f.write(json.dumps(test_metrics) + "\n")
+        f.write(json.dumps(train_cm) + "\n")
+        f.write(json.dumps(test_cm) + "\n")
 
 
-metrics_list = []
-
-# Métricas
-metrics_list.append(compute_metrics(X_train, y_train, "train"))
-metrics_list.append(compute_metrics(X_test, y_test, "test"))
-
-# Matrices
-cm_train = confusion_matrix(y_train, grid.predict(X_train))
-cm_test = confusion_matrix(y_test, grid.predict(X_test))
-
-metrics_list.append(confusion_to_dict(cm_train, "train"))
-metrics_list.append(confusion_to_dict(cm_test, "test"))
-
-# Guardar archivo
-with open("files/output/metrics.json", "w", encoding="utf-8") as f:
-    for row in metrics_list:
-        f.write(json.dumps(row) + "\n")
-
-print("Proceso Completado.")
-
+if __name__ == "__main__":
+    main()
