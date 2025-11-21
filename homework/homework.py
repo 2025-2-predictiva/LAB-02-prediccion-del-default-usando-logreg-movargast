@@ -154,12 +154,14 @@ def clean(df):
 
     df.rename(columns={"default payment next month": "default"}, inplace=True)
 
-    if "ID" in df.columns:
-        df = df.drop(columns=["ID"])
+    df = df.drop(columns=["ID"])
 
-    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
+    # Los registros con EDUCATION=0 o MARRIAGE=0 deben eliminarse (requisito implícito del dataset)
+    df = df[(df["EDUCATION"] != 0) & (df["MARRIAGE"] != 0)]
 
     df = df.dropna()
+
+    df.loc[df["EDUCATION"] > 4, "EDUCATION"] = 4
 
     return df
 
